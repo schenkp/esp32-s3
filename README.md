@@ -1,6 +1,7 @@
 # USB_Commander
 
-Arduino sketch for the **Waveshare ESP32-S3-POE-ETH-8DI-8RO** board.  
+Arduino sketch for the **Waveshare ESP32-S3-POE-ETH-8DI-8RO** board.
+https://www.waveshare.com/esp32-s3-eth-8di-8ro.htm
 Controls 8 relays and reads 8 digital inputs over USB serial, TCP/IP, or MQTT.
 
 ## Features
