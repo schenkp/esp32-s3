@@ -14,6 +14,7 @@
  * Commands (LF or CR+LF terminated, case-insensitive):
  *   RO <1-8> <0|1|T>         Set relay off(0), on(1), or toggle(T)
  *   RO ALL <0|1>              Set all relays off or on
+ *   RO <00-FF>                Set all relays via hex bitmask (bit0=relay1)
  *   RS                        Report relay status  →  RS:XX
  *   RI                        Read all DI channels →  RI:XX
  *   RI <1-8>                  Read one DI channel  →  RI:CHn=0
@@ -241,6 +242,7 @@ static void cmd_buzz(const char *arg, Stream &out) {
 static void cmd_help(Stream &out) {
   out.println("HELP:RO <1-8> <0|1|T>        relay off/on/toggle");
   out.println("HELP:RO ALL <0|1>             all relays off/on");
+  out.println("HELP:RO <00-FF>               all relays via hex bitmask");
   out.println("HELP:RS                       relay status");
   out.println("HELP:RI                       all DI channels");
   out.println("HELP:RI <1-8>                 one DI channel");
@@ -288,7 +290,17 @@ static void cmd_ri(const char *arg, Stream &out) {
 static void cmd_ro(char *arg, Stream &out) {
   if (!arg || arg[0] == '\0') { out.println("ERR:missing channel"); return; }
   char *state_tok = strtok(NULL, " \t");
-  if (!state_tok) { out.println("ERR:missing state"); return; }
+  if (!state_tok) {
+    // Single argument: treat as hex bitmask 00–FF.
+    char *end;
+    long mask = strtol(arg, &end, 16);
+    if (*end != '\0' || mask < 0 || mask > 0xFF) {
+      out.println("ERR:invalid hex mask (00-FF)"); return;
+    }
+    relay_set_all((uint8_t)mask);
+    out.printf("OK:RO:%02X\n", (uint8_t)mask);
+    return;
+  }
   if (strcasecmp(arg, "ALL") == 0) {
     int s = atoi(state_tok);
     relay_set_all(s ? 0xFF : 0x00);

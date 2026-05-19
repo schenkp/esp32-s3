@@ -49,6 +49,7 @@ Commands are plain ASCII, terminated by `LF` or `CR+LF`, case-insensitive.
 |---|---|
 | `RO <1-8> <0\|1\|T>` | Set relay off (0), on (1), or toggle (T) |
 | `RO ALL <0\|1>` | Set all relays off or on |
+| `RO <00-FF>` | Set all relays via hex bitmask (bit0 = relay 1) |
 | `RS` | Report relay status → `RS:XX` (hex bitmask) |
 | `RI` | Read all DI channels → `RI:XX` (hex bitmask) |
 | `RI <1-8>` | Read one DI channel → `RI:CHn=0\|1` |
