@@ -160,6 +160,7 @@ static bool          mqTLS                   = false;
 static char          mqPrefix[MQ_PREFIX_MAX] = "esp32";
 static bool          mqEnabled               = false;
 static unsigned long mqLastReconnect         = 0;
+static unsigned long wifiDisconnectedAt      = 0;
 
 static WiFiClient       mqPlainNet;
 static WiFiClientSecure mqSecureNet;
@@ -628,10 +629,13 @@ static void handle_mq() {
   unsigned long now = millis();
   if (now - mqLastReconnect < 5000) return;
   mqLastReconnect = now;
+  mq->disconnect();  // release any stale TCP socket before reconnecting
   if (mq_do_connect()) {
     Serial.printf("MQ:RECONNECTED=%s:%u\n", mqHost, mqPort);
     if (tcpClient && tcpClient.connected() && (tcpAuthPass[0] == '\0' || tcpAuthenticated))
       tcpClient.printf("MQ:RECONNECTED=%s:%u\n", mqHost, mqPort);
+  } else {
+    Serial.printf("MQ:RECONNECT_FAILED:state=%d\n", mq->state());
   }
 }
 
@@ -770,6 +774,7 @@ void setup() {
 
   if (savedSSID.length() > 0) {
     Serial.printf("WIFI:AUTO_CONNECT=%s\n", savedSSID.c_str());
+    WiFi.setAutoReconnect(true);
     WiFi.begin(savedSSID.c_str(), savedPass.c_str());
     unsigned long tw = millis();
     while (WiFi.status() != WL_CONNECTED && (millis() - tw) < 15000) delay(250);
@@ -810,12 +815,24 @@ void loop() {
 
   if (connected && !wifiServerRunning) {
     tcpServer.begin();
-    wifiServerRunning = true;
+    wifiServerRunning   = true;
+    wifiDisconnectedAt  = 0;
+    mqLastReconnect     = 0;  // reconnect MQTT immediately on WiFi recovery
     Serial.printf("TCP:LISTEN=%d\n", TCP_PORT);
   }
   if (!connected && wifiServerRunning) {
     tcpClient.stop();
-    wifiServerRunning = false;
+    tcpServer.stop();
+    wifiServerRunning  = false;
+    wifiDisconnectedAt = millis();
+    Serial.println("WIFI:DISCONNECTED");
+  }
+  // Reconnect watchdog: nudge the WiFi stack every 30 s while disconnected.
+  if (!connected && wifiDisconnectedAt > 0 &&
+      (millis() - wifiDisconnectedAt) > 30000) {
+    WiFi.reconnect();
+    wifiDisconnectedAt = millis();
+    Serial.println("WIFI:RECONNECTING");
   }
 
   if (wifiServerRunning) handle_tcp();
