@@ -13,7 +13,6 @@
  *
  * Commands (LF or CR+LF terminated, case-insensitive):
  *   RO <1-8> <0|1|T>         Set relay off(0), on(1), or toggle(T)
- *   RO ALL <0|1>              Set all relays off or on
  *   RO <00-FF>                Set all relays via hex bitmask (bit0=relay1)
  *   RS                        Report relay status  →  RS:XX
  *   RI                        Read all DI channels →  RI:XX
@@ -141,6 +140,8 @@ static bool          wifiServerRunning = false;
 
 static bool          tcpAuthenticated  = false;
 static unsigned long led_off_at        = 0;
+static unsigned long heartbeat_next_at = 0;
+static unsigned long heartbeat_off_at  = 0;
 static uint8_t       tcpFailCount      = 0;
 static unsigned long tcpConnectedAt    = 0;
 static char          tcpAuthPass[AUTH_PASS_MAX] = "";
@@ -242,7 +243,6 @@ static void cmd_buzz(const char *arg, Stream &out) {
 
 static void cmd_help(Stream &out) {
   out.println("HELP:RO <1-8> <0|1|T>        relay off/on/toggle");
-  out.println("HELP:RO ALL <0|1>             all relays off/on");
   out.println("HELP:RO <00-FF>               all relays via hex bitmask");
   out.println("HELP:RS                       relay status");
   out.println("HELP:RI                       all DI channels");
@@ -300,12 +300,6 @@ static void cmd_ro(char *arg, Stream &out) {
     }
     relay_set_all((uint8_t)mask);
     out.printf("OK:RO:%02X\n", (uint8_t)mask);
-    return;
-  }
-  if (strcasecmp(arg, "ALL") == 0) {
-    int s = atoi(state_tok);
-    relay_set_all(s ? 0xFF : 0x00);
-    out.printf("OK:RO:ALL=%s\n", s ? "ON" : "OFF");
     return;
   }
   int ch = atoi(arg);
@@ -575,6 +569,7 @@ static void process_command(char *buf, Stream &out, bool is_serial) {
   if (*buf == '\0') return;
   neopixelWrite(RGB_PIN, 0, 0, 60);
   led_off_at = millis() + 20;
+  heartbeat_off_at = 0;
 
   char *cmd = strtok(buf, " \t");
   if (!cmd) return;
@@ -809,6 +804,7 @@ void setup() {
 
 void loop() {
   if (led_off_at && millis() >= led_off_at) { neopixelWrite(RGB_PIN, 0, 0, 0); led_off_at = 0; }
+  if (heartbeat_off_at && millis() >= heartbeat_off_at) { neopixelWrite(RGB_PIN, 0, 0, 0); heartbeat_off_at = 0; }
   handle_serial();
 
   bool connected = (WiFi.status() == WL_CONNECTED);
@@ -837,4 +833,12 @@ void loop() {
 
   if (wifiServerRunning) handle_tcp();
   handle_mq();
+
+  if (millis() >= heartbeat_next_at) {
+    heartbeat_next_at = millis() + 2000;
+    if ((Serial || tcpClient.connected()) && led_off_at == 0) {
+      neopixelWrite(RGB_PIN, 0, 60, 0);
+      heartbeat_off_at = millis() + 20;
+    }
+  }
 }

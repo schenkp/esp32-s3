@@ -13,7 +13,7 @@ Controls 8 relays and reads 8 digital inputs over USB serial, TCP/IP, or MQTT.
 - MQTT / RabbitMQ support (plain or TLS, auto-reconnect, flash-persistent settings)
 - Onboard buzzer command
 - Runtime baud-rate change over USB
-- RGB LED blinks blue on every received command
+- RGB LED blinks blue on every received command; blinks red once per second while a connection is active (USB serial or TCP client)
 
 ## Hardware
 
@@ -49,7 +49,6 @@ Commands are plain ASCII, terminated by `LF` or `CR+LF`, case-insensitive.
 | Command | Description |
 |---|---|
 | `RO <1-8> <0\|1\|T>` | Set relay off (0), on (1), or toggle (T) |
-| `RO ALL <0\|1>` | Set all relays off or on |
 | `RO <00-FF>` | Set all relays via hex bitmask (bit0 = relay 1) |
 | `RS` | Report relay status → `RS:XX` (hex bitmask) |
 | `RI` | Read all DI channels → `RI:XX` (hex bitmask) |
