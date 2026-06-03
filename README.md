@@ -13,7 +13,7 @@ Controls 8 relays and reads 8 digital inputs over USB serial, TCP/IP, or MQTT.
 - MQTT / RabbitMQ support (plain or TLS, auto-reconnect, flash-persistent settings)
 - Onboard buzzer command
 - Runtime baud-rate change over USB
-- RGB LED blinks blue on every received command; blinks red once per second while a connection is active (USB serial or TCP client)
+- RGB LED blinks blue on every received command; blinks red once every two seconds while a connection is active (USB serial, TCP client, or MQTT)
 
 ## Hardware
 

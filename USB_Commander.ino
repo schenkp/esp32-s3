@@ -836,7 +836,7 @@ void loop() {
 
   if (millis() >= heartbeat_next_at) {
     heartbeat_next_at = millis() + 2000;
-    if ((Serial || tcpClient.connected()) && led_off_at == 0) {
+    if ((Serial || tcpClient.connected() || mq->connected()) && led_off_at == 0) {
       neopixelWrite(RGB_PIN, 0, 60, 0);
       heartbeat_off_at = millis() + 20;
     }
