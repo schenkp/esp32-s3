@@ -60,6 +60,9 @@
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 
 #define DEFAULT_BAUD  921600
 #define CMD_BUF_SIZE  128
@@ -160,7 +163,6 @@ static char          mqPass[MQ_PASS_MAX]     = "";
 static bool          mqTLS                   = false;
 static char          mqPrefix[MQ_PREFIX_MAX] = "esp32";
 static bool          mqEnabled               = false;
-static unsigned long mqLastReconnect         = 0;
 static unsigned long wifiDisconnectedAt      = 0;
 
 static WiFiClient       mqPlainNet;
@@ -168,6 +170,34 @@ static WiFiClientSecure mqSecureNet;
 static PubSubClient     mqPlainPub(mqPlainNet);
 static PubSubClient     mqSecurePub(mqSecureNet);
 static PubSubClient    *mq = &mqPlainPub;
+
+// ─── MQTT background task plumbing ───────────────────────────────────────────
+// All direct use of `mq` (connect/loop/publish) happens on mqttTask, never on
+// the main loop() task, so a slow/blocked broker connection can never stall
+// serial/TCP/relay handling. loop() only touches the plain flags/queues below.
+
+#define MQ_TOPIC_MAX  (MQ_PREFIX_MAX + 8)
+#define MQ_NOTICE_MAX 96
+
+struct MqPubMsg {
+  char topic[MQ_TOPIC_MAX];
+  char payload[256];
+};
+
+struct MqIncomingMsg {
+  char topic[MQ_TOPIC_MAX];
+  char payload[CMD_BUF_SIZE];
+};
+
+static QueueHandle_t   mqPublishQueue   = nullptr;
+static QueueHandle_t   mqIncomingQueue  = nullptr;
+static QueueHandle_t   mqNoticeQueue    = nullptr;
+static volatile bool   mqIsConnected    = false;
+// Set by loop() (WiFi just recovered) or cmd_mq() (MQ CONNECT) to make
+// mqttTask retry immediately instead of waiting out its 5 s backoff.
+static volatile bool   mqForceReconnect = false;
+// Set by cmd_mq() (MQ DISCONNECT / MQ FORGET) to ask mqttTask to drop the link.
+static volatile bool   mqDisconnectNow  = false;
 
 // Defined after process_command() because it calls it.
 static void mq_on_message(char *topic, byte *payload, unsigned int len);
@@ -178,11 +208,17 @@ class MqttResponseStream : public Stream {
   uint8_t _len = 0;
 
   void publish_line() {
-    if (_len == 0 || !mq->connected()) { _len = 0; return; }
+    if (_len == 0 || !mqIsConnected) { _len = 0; return; }
     _buf[_len] = '\0';
-    char topic[MQ_PREFIX_MAX + 6];
-    snprintf(topic, sizeof(topic), "%s/resp", mqPrefix);
-    mq->publish(topic, _buf);
+    MqPubMsg m;
+    snprintf(m.topic, sizeof(m.topic), "%s/resp", mqPrefix);
+    strncpy(m.payload, _buf, sizeof(m.payload) - 1);
+    m.payload[sizeof(m.payload) - 1] = '\0';
+    if (xQueueSend(mqPublishQueue, &m, 0) != pdTRUE) {
+      char notice[MQ_NOTICE_MAX];
+      snprintf(notice, sizeof(notice), "MQ:PUB_DROPPED:queue_full");
+      xQueueSend(mqNoticeQueue, notice, 0);
+    }
     _len = 0;
   }
 public:
@@ -210,6 +246,8 @@ static void mq_apply_settings() {
   }
   mq->setServer(mqHost, mqPort);
   mq->setCallback(mq_on_message);
+  mq->setKeepAlive(5);      // detect a dead broker session faster than the 15 s default
+  mq->setSocketTimeout(3);  // bound the connect/CONNACK wait (this now runs on mqttTask)
 }
 
 static bool mq_do_connect() {
@@ -509,7 +547,7 @@ static void cmd_mq(char *sub, Stream &out) {
     out.printf("MQ:USER=%s\n",      mqUser);
     out.printf("MQ:PREFIX=%s\n",    mqPrefix);
     out.printf("MQ:ENABLED=%d\n",   mqEnabled ? 1 : 0);
-    out.printf("MQ:CONNECTED=%d\n", mq->connected() ? 1 : 0);
+    out.printf("MQ:CONNECTED=%d\n", mqIsConnected ? 1 : 0);
     return;
   }
   if (strcasecmp(sub, "CONNECT") == 0) {
@@ -523,27 +561,23 @@ static void cmd_mq(char *sub, Stream &out) {
     prefs.putString("prefix",  mqPrefix);
     prefs.putBool("enabled",   true);
     prefs.end();
-    mqEnabled = true;
-    mq_apply_settings();
+    mqEnabled        = true;
+    mqForceReconnect = true;  // let mqttTask (re)connect immediately, off the main loop
     if (WiFi.status() != WL_CONNECTED) {
       out.println("OK:MQ:SAVED_WILL_CONNECT_WHEN_WIFI_READY"); return;
     }
-    out.printf("MQ:CONNECTING=%s:%u\n", mqHost, mqPort);
-    if (mq_do_connect())
-      out.printf("OK:MQ:CONNECTED=%s:%u\n", mqHost, mqPort);
-    else
-      out.printf("ERR:MQ:CONNECT_FAILED:state=%d\n", mq->state());
+    out.printf("OK:MQ:CONNECTING=%s:%u\n", mqHost, mqPort);
     return;
   }
   if (strcasecmp(sub, "DISCONNECT") == 0) {
-    mqEnabled = false;
-    mq->disconnect();
+    mqEnabled       = false;
+    mqDisconnectNow = true;
     prefs.begin("mq", false); prefs.putBool("enabled", false); prefs.end();
     out.println("OK:MQ:DISCONNECTED"); return;
   }
   if (strcasecmp(sub, "FORGET") == 0) {
-    mqEnabled = false;
-    mq->disconnect();
+    mqEnabled       = false;
+    mqDisconnectNow = true;
     prefs.begin("mq", false); prefs.clear(); prefs.end();
     mqHost[0] = '\0'; mqUser[0] = '\0'; mqPass[0] = '\0';
     mqPort = 1883; mqTLS = false;
@@ -551,12 +585,17 @@ static void cmd_mq(char *sub, Stream &out) {
     out.println("OK:MQ:FORGOTTEN"); return;
   }
   if (strcasecmp(sub, "PUB") == 0) {
-    if (!mq->connected()) { out.println("ERR:MQ:not connected"); return; }
+    if (!mqIsConnected) { out.println("ERR:MQ:not connected"); return; }
     char *topic = strtok(NULL, " \t");
     if (!topic) { out.println("ERR:MQ:missing topic"); return; }
     char *payload = topic + strlen(topic) + 1;
     while (*payload == ' ' || *payload == '\t') payload++;
-    mq->publish(topic, payload);
+    MqPubMsg m;
+    strncpy(m.topic, topic, sizeof(m.topic) - 1); m.topic[sizeof(m.topic) - 1] = '\0';
+    strncpy(m.payload, payload, sizeof(m.payload) - 1); m.payload[sizeof(m.payload) - 1] = '\0';
+    if (xQueueSend(mqPublishQueue, &m, 0) != pdTRUE) {
+      out.println("ERR:MQ:PUB_QUEUE_FULL"); return;
+    }
     out.printf("OK:MQ:PUB:%s=%s\n", topic, payload); return;
   }
   out.printf("ERR:MQ:unknown subcommand '%s'\n", sub);
@@ -605,32 +644,85 @@ static void process_command(char *buf, Stream &out, bool is_serial) {
 
 // ─── MQTT callbacks and reconnect helper ─────────────────────────────────────
 
+// Runs on mqttTask (invoked from within mq->loop()) — must not touch Serial,
+// tcpClient, or process_command()'s shared state directly. Hand the message
+// to loop() via a queue instead.
 static void mq_on_message(char *topic, byte *payload, unsigned int len) {
-  char cmd[CMD_BUF_SIZE];
-  if (len >= sizeof(cmd)) len = sizeof(cmd) - 1;
-  memcpy(cmd, payload, len);
-  cmd[len] = '\0';
-  // Log the incoming command to serial/TCP for monitoring.
-  Serial.printf("MQ:MSG:%s=%s\n", topic, cmd);
-  if (tcpClient && tcpClient.connected() && (tcpAuthPass[0] == '\0' || tcpAuthenticated))
-    tcpClient.printf("MQ:MSG:%s=%s\n", topic, cmd);
-  // Responses are published back to <prefix>/resp.
-  process_command(cmd, mqOut, false);
+  MqIncomingMsg msg;
+  strncpy(msg.topic, topic, sizeof(msg.topic) - 1);
+  msg.topic[sizeof(msg.topic) - 1] = '\0';
+  if (len >= sizeof(msg.payload)) len = sizeof(msg.payload) - 1;
+  memcpy(msg.payload, payload, len);
+  msg.payload[len] = '\0';
+  xQueueSend(mqIncomingQueue, &msg, 0);
 }
 
-static void handle_mq() {
-  if (!mqEnabled || WiFi.status() != WL_CONNECTED) return;
-  if (mq->connected()) { mq->loop(); return; }
-  unsigned long now = millis();
-  if (now - mqLastReconnect < 5000) return;
-  mqLastReconnect = now;
-  mq->disconnect();  // release any stale TCP socket before reconnecting
-  if (mq_do_connect()) {
-    Serial.printf("MQ:RECONNECTED=%s:%u\n", mqHost, mqPort);
+// Drains what mqttTask queued up: log lines (mirrored to Serial/TCP like
+// before) and incoming /cmd messages (dispatched via process_command(), same
+// as before) — called once per loop() iteration, on the main task only.
+static void handle_mq_events() {
+  char notice[MQ_NOTICE_MAX];
+  while (xQueueReceive(mqNoticeQueue, notice, 0) == pdTRUE) {
+    Serial.println(notice);
     if (tcpClient && tcpClient.connected() && (tcpAuthPass[0] == '\0' || tcpAuthenticated))
-      tcpClient.printf("MQ:RECONNECTED=%s:%u\n", mqHost, mqPort);
-  } else {
-    Serial.printf("MQ:RECONNECT_FAILED:state=%d\n", mq->state());
+      tcpClient.println(notice);
+  }
+
+  MqIncomingMsg msg;
+  while (xQueueReceive(mqIncomingQueue, &msg, 0) == pdTRUE) {
+    Serial.printf("MQ:MSG:%s=%s\n", msg.topic, msg.payload);
+    if (tcpClient && tcpClient.connected() && (tcpAuthPass[0] == '\0' || tcpAuthenticated))
+      tcpClient.printf("MQ:MSG:%s=%s\n", msg.topic, msg.payload);
+    // Responses are published back to <prefix>/resp.
+    process_command(msg.payload, mqOut, false);
+  }
+}
+
+// Owns `mq` exclusively: connect/loop/publish all happen here so a blocked or
+// slow broker connection never stalls loop() (serial/TCP/relay handling).
+static void mqttTaskFn(void *) {
+  unsigned long lastAttempt = millis() - 5000;  // allow an immediate first attempt
+  for (;;) {
+    if (mqDisconnectNow) {
+      mqDisconnectNow = false;
+      mq->disconnect();
+      mqIsConnected = false;
+    }
+
+    bool wifiUp = (WiFi.status() == WL_CONNECTED);
+    if (mqForceReconnect) {
+      mqForceReconnect = false;
+      lastAttempt = millis() - 5000;
+    }
+
+    if (mqEnabled && wifiUp) {
+      if (mq->connected()) {
+        mq->loop();
+        mqIsConnected = true;
+        MqPubMsg m;
+        while (xQueueReceive(mqPublishQueue, &m, 0) == pdTRUE)
+          mq->publish(m.topic, m.payload);
+      } else {
+        mqIsConnected = false;
+        unsigned long now = millis();
+        if (now - lastAttempt >= 5000) {
+          lastAttempt = now;
+          mq_apply_settings();
+          mq->disconnect();  // release any stale TCP socket before reconnecting
+          char notice[MQ_NOTICE_MAX];
+          if (mq_do_connect()) {
+            snprintf(notice, sizeof(notice), "MQ:RECONNECTED=%s:%u", mqHost, mqPort);
+          } else {
+            snprintf(notice, sizeof(notice), "MQ:RECONNECT_FAILED:state=%d", mq->state());
+          }
+          xQueueSend(mqNoticeQueue, notice, 0);
+        }
+      }
+    } else {
+      mqIsConnected = false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
@@ -793,11 +885,20 @@ void setup() {
     prefs.getString("prefix", "esp32").toCharArray(mqPrefix, MQ_PREFIX_MAX);
     if (prefs.getBool("enabled", false)) {
       mqEnabled = true;
-      mq_apply_settings();
       Serial.printf("MQ:AUTO_CONNECT=%s:%u\n", mqHost, mqPort);
     }
   }
   prefs.end();
+
+  // mqttTask owns all direct use of `mq` (connect/loop/publish) from here on;
+  // it applies mq_apply_settings() itself before every connect attempt.
+  // Sized above cmd_help()'s line count (the largest single burst of MQ:resp
+  // lines any one command can produce) so a fast producer never outruns
+  // mqttTask's drain rate and silently drops output.
+  mqPublishQueue  = xQueueCreate(40, sizeof(MqPubMsg));
+  mqIncomingQueue = xQueueCreate(8, sizeof(MqIncomingMsg));
+  mqNoticeQueue   = xQueueCreate(8, MQ_NOTICE_MAX);
+  xTaskCreatePinnedToCore(mqttTaskFn, "mqttTask", 8192, nullptr, 1, nullptr, 0);
 
   Serial.printf("READY:%d\n", DEFAULT_BAUD);
 }
@@ -813,7 +914,7 @@ void loop() {
     tcpServer.begin();
     wifiServerRunning   = true;
     wifiDisconnectedAt  = 0;
-    mqLastReconnect     = 0;  // reconnect MQTT immediately on WiFi recovery
+    mqForceReconnect    = true;  // reconnect MQTT immediately on WiFi recovery
     Serial.printf("TCP:LISTEN=%d\n", TCP_PORT);
   }
   if (!connected && wifiServerRunning) {
@@ -832,11 +933,11 @@ void loop() {
   }
 
   if (wifiServerRunning) handle_tcp();
-  handle_mq();
+  handle_mq_events();
 
   if (millis() >= heartbeat_next_at) {
     heartbeat_next_at = millis() + 2000;
-    if ((Serial || tcpClient.connected() || mq->connected()) && led_off_at == 0) {
+    if ((Serial || tcpClient.connected() || mqIsConnected) && led_off_at == 0) {
       neopixelWrite(RGB_PIN, 0, 60, 0);
       heartbeat_off_at = millis() + 20;
     }
